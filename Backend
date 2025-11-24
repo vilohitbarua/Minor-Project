@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""
+Professional Result Analysis Website
+Flask application for student performance analysis
+"""
+
+from flask import Flask, render_template, request, jsonify
+import pandas as pd
+import os
+from werkzeug.utils import secure_filename
+import json
+from statistics import mean, median, stdev
+import numpy as np
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['UPLOAD_FOLDER'] = 'uploads'
+
+# Create uploads folder if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Store current data
+current_data = None
+current_filename = None
+
+ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def process_excel_file(filepath):
+    """Process Excel file and return structured data"""
+    try:
+        if filepath.endswith('.csv'):
+            df = pd.read_csv(filepath)
+        else:
+            df = pd.read_excel(filepath)
+        
+        # Ensure we have the right columns
+        # Expected: Student, Subject 1, Subject 2, Subject 3, Subject 4, Subject 5
+        return df
+    except Exception as e:
+        raise ValueError(f"Error reading file: {str(e)}")
+
+def calculate_statistics(df):
+    """Calculate comprehensive statistics from student data"""
+    stats = {}
+    all_scores_by_subject = {i: [] for i in range(10)}  # Max 10 subjects
+    
+    # Get subject columns (all columns except Student)
+    subject_cols = [col for col in df.columns if col != 'Student' and col != 'student' and col.lower() != 'name']
+    
+    for idx, row in df.iterrows():
+        student_name = row[df.columns[0]]
+        scores = [float(row[col]) for col in subject_cols if pd.notna(row[col])]
+        
+        # Collect scores for standard deviation calculation
+        for i, score in enumerate(scores):
+            all_scores_by_subject[i].append(score)
+        
+        total = sum(scores)
+        percentage = (total / (len(scores) * 100)) * 100 if scores else 0
+        
+        # Calculate grade
+        if percentage >= 90:
+            grade = 'A+'
+        elif percentage >= 80:
+            grade = 'A'
+        elif percentage >= 70:
+            grade = 'B'
+        elif percentage >= 60:
+            grade = 'C'
+        else:
+            grade = 'D'
+        
+        # Find strong and weak subjects
+        max_score_idx = scores.index(max(scores)) if scores else 0
+        min_score_idx = scores.index(min(scores)) if scores else 0
+        
+        stats[student_name] = {
+            'scores': scores,
+            'total': round(total, 2),
+            'percentage': round(percentage, 2),
+            'grade': grade,
+            'subject_count': len(scores),
+            'strong_subject': subject_cols[max_score_idx] if max_score_idx < len(subject_cols) else 'N/A',
+            'strong_subject_score': round(max(scores), 2) if scores else 0,
+            'weak_subject': subject_cols[min_score_idx] if min_score_idx < len(subject_cols) else 'N/A',
+            'weak_subject_score': round(min(scores), 2) if scores else 0
+        }
+    
+    # Calculate standard deviations per subject
+    subject_stats = {}
+    for i, subject in enumerate(subject_cols):
+        scores_list = all_scores_by_subject[i]
+        if len(scores_list) > 1:
+            std_dev = round(stdev(scores_list), 2)
+        else:
+            std_dev = 0
+        subject_stats[subject] = {
+            'average': round(mean(scores_list), 2) if scores_list else 0,
+            'std_dev': std_dev,
+            'highest': round(max(scores_list), 2) if scores_list else 0,
+            'lowest': round(min(scores_list), 2) if scores_list else 0
+        }
+    
+    return stats, subject_cols, subject_stats
+
+@app.route('/')
+def index():
+    """Render homepage"""
+    return render_template('index.html')
+
+@app.route('/learners')
+def learners():
+    """Render the Advanced and Slow Learners Analysis page"""
+    return render_template('code.html')
+
+@app.route('/analysis')
+def analysis():
+    """Alternative route for the analysis page"""
+    return render_template('code.html')
+
+@app.route('/api/csv/<key>')
+def get_csv_data(key):
+    """Serve CSV file data as cleaned JSON. Accepts short keys like 'WT','EOM' etc.
+
+    Returns JSON: { success: True, data: [...records...], headers: [...] }
+    Each record has normalized keys: name, roll, total, category
+    Categories are computed based on marks vs. subject average.
+    """
+    mapping = {
+        'WT': 'WT-Table 1.csv',
+        'EOM': 'EOM-Table 1.csv',
+        'DBMS': 'DBMS-Table 1.csv',
+        'ITPC': 'ITPC-Table 1.csv',
+        'IKS': 'IKS-Table 1.csv'
+    }
+
+    if key not in mapping:
+        return jsonify({'error': 'Invalid file key'}), 400
+
+    filename = mapping[key]
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    filepath = os.path.join(base_dir, filename)
+
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found'}), 404
+
+    try:
+        df = pd.read_csv(filepath)
+    except Exception as e:
+        return jsonify({'error': 'Failed to read CSV', 'details': str(e)}), 500
+
+    cols = list(df.columns)
+
+    def choose(cols, candidates):
+        low = [c.lower() for c in cols]
+        for cand in candidates:
+            for i, c in enumerate(low):
+                if cand in c:
+                    return cols[i]
+        return None
+
+    name_col = choose(cols, ['name', 'student']) or (cols[0] if cols else None)
+    roll_col = choose(cols, ['roll', 'id', 'roll number']) or (cols[1] if len(cols) > 1 else name_col)
+    total_col = choose(cols, ['total', 'marks', 'obtained', 'obtain']) or (cols[-1] if cols else None)
+    category_col = choose(cols, ['learner', 'a/s', 'a s', 'a s learner']) or next((c for c in cols if 'learner' in c.lower()), None)
+
+    # Calculate average marks for classification
+    marks_list = []
+    for _, row in df.iterrows():
+        if total_col and total_col in df.columns:
+            try:
+                mark = float(row[total_col])
+                if pd.notna(mark):
+                    marks_list.append(mark)
+            except Exception:
+                pass
+    
+    avg_marks = sum(marks_list) / len(marks_list) if marks_list else 0
+    
+    # Build cleaned records with mark-based classification
+    cleaned = []
+    for _, row in df.iterrows():
+        name = str(row.get(name_col, '')).strip() if name_col in df.columns else ''
+        roll = str(row.get(roll_col, '')).strip() if roll_col in df.columns else ''
+        total_raw = row.get(total_col, '') if total_col in df.columns else ''
+        try:
+            total = float(total_raw) if (pd.notna(total_raw) and str(total_raw).strip() != '') else ''
+        except Exception:
+            total = str(total_raw)
+        
+        # Determine category based on marks vs average
+        category = ''
+        if isinstance(total, (int, float)) and total != '':
+            if total > avg_marks * 1.1:  # 10% above average = Advance Learner
+                category = 'Advance Learner'
+            elif total < avg_marks * 0.9:  # 10% below average = Slow Learner
+                category = 'Slow Learner'
+            else:
+                category = 'Average Learner'
+        elif category_col and category_col in df.columns:
+            # Fallback to CSV category if marks-based classification fails
+            category = str(row.get(category_col, '')).strip()
+
+        cleaned.append({'name': name, 'roll': roll, 'total': total, 'category': category})
+
+    return jsonify({'success': True, 'data': cleaned, 'headers': cols, 'avg_marks': round(avg_marks, 2)})
+
+
+@app.route('/api/counts')
+def get_counts():
+    """Return counts and total marks per subject for quick UI display.
+
+    Response format:
+    {
+      "WT": {"total_students": 45, "total_marks": 3450, "advance": 5, "average": 30, "slow": 10},
+      "EOM": { ... }
+    }
+    """
+    mapping = {
+        'WT': 'WT-Table 1.csv',
+        'EOM': 'EOM-Table 1.csv',
+        'DBMS': 'DBMS-Table 1.csv',
+        'ITPC': 'ITPC-Table 1.csv',
+        'IKS': 'IKS-Table 1.csv'
+    }
+
+    results = {}
+    for key, filename in mapping.items():
+        filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        if not os.path.exists(filepath):
+            results[key] = {'total_students': 0, 'total_marks': 0, 'advance': 0, 'average': 0, 'slow': 0}
+            continue
+        try:
+            df = pd.read_csv(filepath)
+        except Exception:
+            results[key] = {'total_students': 0, 'total_marks': 0, 'advance': 0, 'average': 0, 'slow': 0}
+            continue
+
+        total_students = 0
+        total_marks = 0
+        advance = 0
+        average = 0
+        slow = 0
+
+        # Find the "total marks" column
+        cols = list(df.columns)
+        def choose(cols, candidates):
+            low = [c.lower() for c in cols]
+            for cand in candidates:
+                for i, c in enumerate(low):
+                    if cand in c:
+                        return cols[i]
+            return None
+
+        total_col = choose(cols, ['total', 'marks', 'obtained', 'obtain'])
+
+        # iterate rows and look for category keywords across all columns
+        for _, row in df.iterrows():
+            # consider row non-empty if any non-NaN value exists
+            if row.isnull().all():
+                continue
+            total_students += 1
+            joined = ' '.join([str(x).lower() for x in row.values if pd.notna(x)])
+            
+            # Sum total marks if column found
+            if total_col and total_col in df.columns:
+                try:
+                    marks = float(row[total_col])
+                    if pd.notna(marks):
+                        total_marks += marks
+                except Exception:
+                    pass
+
+            if 'advance learner' in joined or ('advance' in joined and 'learner' in joined):
+                advance += 1
+            elif 'average learner' in joined or 'average' in joined:
+                average += 1
+            elif 'slow learner' in joined or 'slow' in joined:
+                slow += 1
+            else:
+                # Try shorthand 'a/s' or 'a s' classification
+                if 'a/s' in joined or 'a s' in joined:
+                    # if contains a/s we won't increment specific bucket; leave as average
+                    average += 1
+
+        results[key] = {
+            'total_students': total_students,
+            'total_marks': int(total_marks),
+            'advance': advance,
+            'average': average,
+            'slow': slow
+        }
+
+    return jsonify(results)
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Handle file upload"""
+    global current_data, current_filename
+    
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'error': 'No file provided'})
+    
+    file = request.files['file']
+    
+    if file.filename == '':
+        return jsonify({'success': False, 'error': 'No file selected'})
+    
+    if not allowed_file(file.filename):
+        return jsonify({'success': False, 'error': 'Only Excel and CSV files are allowed'})
+    
+    try:
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        # Process the file
+        df = process_excel_file(filepath)
+        stats, subject_cols, subject_stats = calculate_statistics(df)
+        
+        # Calculate class-wide statistics
+        all_percentages = [data['percentage'] for data in stats.values()]
+        
+        class_stats = {
+            'total_students': len(stats),
+            'average': round(mean(all_percentages), 2) if all_percentages else 0,
+            'median': round(median(all_percentages), 2) if all_percentages else 0,
+            'highest': round(max(all_percentages), 2) if all_percentages else 0,
+            'lowest': round(min(all_percentages), 2) if all_percentages else 0,
+            'std_dev': round(stdev(all_percentages), 2) if len(all_percentages) > 1 else 0
+        }
+        
+        current_data = {
+            'dataframe': df,
+            'stats': stats,
+            'subject_cols': subject_cols,
+            'subject_stats': subject_stats,
+            'class_stats': class_stats,
+            'students': list(stats.keys())
+        }
+        current_filename = filename
+        
+        return jsonify({
+            'success': True,
+            'students': current_data['students'],
+            'subjects': current_data['subject_cols'],
+            'total_students': len(current_data['students']),
+            'message': f'Successfully loaded {len(current_data["students"])} students'
+        })
+    
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/student/<student_name>')
+def get_student_data(student_name):
+    """Get data for a specific student with comprehensive analysis"""
+    if not current_data:
+        return jsonify({'error': 'No data loaded'}), 400
+    
+    if student_name not in current_data['stats']:
+        return jsonify({'error': 'Student not found'}), 404
+    
+    student_stats = current_data['stats'][student_name]
+    
+    # Find rank
+    all_percentages = [(name, data['percentage']) for name, data in current_data['stats'].items()]
+    all_percentages.sort(key=lambda x: x[1], reverse=True)
+    rank = next(i + 1 for i, (name, _) in enumerate(all_percentages) if name == student_name)
+    
+    # Calculate class statistics
+    all_percentages_list = [data['percentage'] for data in current_data['stats'].values()]
+    class_stats = {
+        'average': round(mean(all_percentages_list), 2) if all_percentages_list else 0,
+        'median': round(median(all_percentages_list), 2) if all_percentages_list else 0,
+        'highest_percentage': round(max(all_percentages_list), 2) if all_percentages_list else 0,
+        'lowest_percentage': round(min(all_percentages_list), 2) if all_percentages_list else 0,
+        'std_dev': round(stdev(all_percentages_list), 2) if len(all_percentages_list) > 1 else 0
+    }
+    
+    # Calculate subject-wise performance vs class average
+    subject_performance = []
+    for i, subject in enumerate(current_data['subject_cols']):
+        student_score = student_stats['scores'][i]
+        subject_stats = current_data['subject_stats'][subject]
+        
+        subject_performance.append({
+            'name': subject,
+            'student_score': student_score,
+            'class_average': subject_stats['average'],
+            'class_std_dev': subject_stats['std_dev'],
+            'class_highest': subject_stats['highest'],
+            'class_lowest': subject_stats['lowest']
+        })
+    
+    # Calculate percentile rank
+    student_percentage = student_stats['percentage']
+    percentile = round((rank - 1) / len(current_data['students']) * 100, 2)
+    
+    return jsonify({
+        'name': student_name,
+        'rank': rank,
+        'total_students': len(current_data['students']),
+        'scores': student_stats['scores'],
+        'total': student_stats['total'],
+        'percentage': student_stats['percentage'],
+        'grade': student_stats['grade'],
+        'strong_subject': student_stats['strong_subject'],
+        'strong_subject_score': student_stats['strong_subject_score'],
+        'weak_subject': student_stats['weak_subject'],
+        'weak_subject_score': student_stats['weak_subject_score'],
+        'percentile': percentile,
+        'class_stats': class_stats,
+        'subject_performance': subject_performance,
+        'subjects': current_data['subject_cols']
+    })
+
+@app.route('/api/comparison/<student_name>')
+def get_comparison_data(student_name):
+    """Get comparison data for a student vs all students"""
+    if not current_data:
+        return jsonify({'error': 'No data loaded'}), 400
+    
+    if student_name not in current_data['stats']:
+        return jsonify({'error': 'Student not found'}), 404
+    
+    student_percentage = current_data['stats'][student_name]['percentage']
+    
+    # Get all students sorted by percentage
+    all_students = []
+    for name, stats in current_data['stats'].items():
+        all_students.append({
+            'name': name,
+            'percentage': stats['percentage'],
+            'isSelected': name == student_name
+        })
+    
+    all_students.sort(key=lambda x: x['percentage'], reverse=True)
+    
+    # Calculate statistics
+    percentages = [s['percentage'] for s in all_students]
+    class_stats = {
+        'average': round(mean(percentages), 2),
+        'median': round(median(percentages), 2),
+        'highest': max(percentages),
+        'lowest': min(percentages),
+        'selected_percentage': student_percentage
+    }
+    
+    return jsonify({
+        'students': all_students,
+        'stats': class_stats
+    })
+
+@app.route('/api/overall-stats')
+def get_overall_stats():
+    """Get overall class statistics"""
+    if not current_data:
+        return jsonify({'error': 'No data loaded'}), 400
+    
+    all_stats = []
+    for name, stats in current_data['stats'].items():
+        all_stats.append({
+            'name': name,
+            'percentage': stats['percentage'],
+            'grade': stats['grade'],
+            'total': stats['total']
+        })
+    
+    all_stats.sort(key=lambda x: x['percentage'], reverse=True)
+    
+    percentages = [s['percentage'] for s in all_stats]
+    
+    return jsonify({
+        'students': all_stats,
+        'class_average': round(mean(percentages), 2),
+        'highest': max(percentages),
+        'lowest': min(percentages),
+        'median': round(median(percentages), 2),
+        'std_dev': round(stdev(percentages), 2) if len(percentages) > 1 else 0,
+        'total_students': len(all_stats)
+    })
+
+@app.route('/api/all-students')
+def get_all_students():
+    """Get all students with basic stats for quick reference"""
+    if not current_data:
+        return jsonify({'error': 'No data loaded'}), 400
+    
+    students_list = []
+    for idx, (name, stats) in enumerate(current_data['stats'].items()):
+        students_list.append({
+            'index': idx + 1,
+            'name': name,
+            'percentage': stats['percentage'],
+            'grade': stats['grade'],
+            'total': stats['total']
+        })
+    
+    # Sort by percentage
+    students_list.sort(key=lambda x: x['percentage'], reverse=True)
+    
+    return jsonify({
+        'students': students_list,
+        'total': len(students_list)
+    })
+
+if __name__ == '__main__':
+    print("🚀 Starting Professional Result Analysis Server...")
+    print("📂 Visit: http://localhost:8000")
+    app.run(debug=True, port=8000, use_reloader=False)
