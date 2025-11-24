@@ -233,23 +233,23 @@
   <div class="subject-grid">
     <div class="subject-card">
       <h3>Web Technologies (WT)</h3>
-      <button class="excel-btn" onclick="loadData('WT-Table 1.csv', 'Web Technologies')">View Data</button>
+      <button class="excel-btn" onclick="loadData('WT', 'Web Technologies')">View Data</button>
     </div>
     <div class="subject-card">
       <h3>Essentials of Management (EOM)</h3>
-      <button class="excel-btn" onclick="loadData('EOM-Table 1.csv', 'Essentials of Management')">View Data</button>
+      <button class="excel-btn" onclick="loadData('EOM', 'Essentials of Management')">View Data</button>
     </div>
     <div class="subject-card">
       <h3>Database Management System (DBMS)</h3>
-      <button class="excel-btn" onclick="loadData('DBMS-Table 1.csv', 'Database Management System')">View Data</button>
+      <button class="excel-btn" onclick="loadData('DBMS', 'Database Management System')">View Data</button>
     </div>
     <div class="subject-card">
       <h3>Information Technology & Programming Concepts (ITPC)</h3>
-      <button class="excel-btn" onclick="loadData('ITPC-Table 1.csv', 'Information Technology & Programming Concepts')">View Data</button>
+      <button class="excel-btn" onclick="loadData('ITPC', 'Information Technology & Programming Concepts')">View Data</button>
     </div>
     <div class="subject-card">
       <h3>Indian Knowledge System (IKS)</h3>
-      <button class="excel-btn" onclick="loadData('IKS-Table 1.csv', 'Indian Knowledge System')">View Data</button>
+      <button class="excel-btn" onclick="loadData('IKS', 'Indian Knowledge System')">View Data</button>
     </div>
   </div>
 
@@ -287,55 +287,150 @@
       table.innerHTML = '';
       stats.innerHTML = '';
 
-      // Fetch the CSV file
-      fetch(filename)
+      // Try backend API first (Flask). If it fails, fall back to local CSV fetch (Live Server).
+      const apiUrl = `/api/csv/${encodeURIComponent(filename)}`;
+      fetch(apiUrl)
         .then(response => {
-          if (!response.ok) throw new Error('File not found');
-          return response.text();
+          if (!response.ok) throw new Error('API not available');
+          return response.json();
         })
-        .then(csv => {
+        .then(result => {
           loading.style.display = 'none';
-          const data = parseCSV(csv);
-          displayData(data, stats, table);
+          const data = { headers: result.headers, data: result.data };
+          displayData(data, stats, table, filename);
         })
-        .catch(err => {
-          loading.style.display = 'none';
-          error.style.display = 'block';
-          error.textContent = 'Error loading file: ' + err.message;
-          console.error('Error:', err);
+        .catch(apiErr => {
+          // Fallback: try to fetch the CSV file directly (for Live Server or static hosting)
+          const localUrl = `/static/data/${filename.toLowerCase()}.csv`;
+          fetch(localUrl)
+            .then(response => {
+              if (!response.ok) throw new Error('Local file not found (' + response.status + ')');
+              return response.text();
+            })
+            .then(csv => {
+              loading.style.display = 'none';
+              const data = parseCSV(csv);
+              displayData(data, stats, table, filename);
+            })
+            .catch(localErr => {
+              loading.style.display = 'none';
+              error.style.display = 'block';
+              error.textContent = 'Error loading file: ' + (apiErr.message || apiErr) + ' / ' + (localErr.message || localErr);
+              console.error('API error:', apiErr);
+              console.error('Local fetch error:', localErr);
+            });
         });
     }
 
+    // Simple CSV parser used for local fallback. Handles basic comma-separated CSVs.
     function parseCSV(csv) {
       const lines = csv.trim().split('\n');
-      const headers = lines[1].split(',').map(h => h.trim()); // Row 2 has headers
-      const dataRows = lines.slice(2);
+      const headers = lines[0].split(',').map(h => h.trim());
+      const dataRows = lines.slice(1);
 
       const data = dataRows.map(line => {
+        // naive split; assumes no commas inside values
         const values = line.split(',').map(v => v.trim());
         const row = {};
         headers.forEach((header, index) => {
           row[header] = values[index] || '';
         });
         return row;
-      });
+      }).filter(r => Object.keys(r).length > 0);
 
       return { headers, data };
     }
 
-    function displayData(data, statsContainer, tableContainer) {
-      // Calculate statistics
-      const stats = calculateStatistics(data.data);
+    function pickColumns(headers, rows) {
+      // Try to pick columns: name, roll/id, total marks, learner category
+      const headerCandidates = headers.map(h => h.toString().toLowerCase());
+      const res = {
+        name: null,
+        roll: null,
+        total: null,
+        category: null,
+        other: []
+      };
+
+      // find category by scanning values for keywords
+      for (let i = 0; i < headers.length; i++) {
+        const h = headers[i];
+        const colValues = rows.map(r => (r[h] || '').toString().toLowerCase());
+        if (!res.category && colValues.some(v => v.includes('advance learner') || v.includes('average learner') || v.includes('slow learner') || v.includes('a/s learner'))) {
+          res.category = h;
+        }
+        if (!res.total && (h.toLowerCase().includes('total') || h.toLowerCase().includes('marks') || colValues.every(v => v === '' || !isNaN(parseFloat(v))))) {
+          // ensure not the category column
+          if (res.category !== h) res.total = h;
+        }
+        if (!res.name && (h.toLowerCase().includes('name') || colValues.some(v => /^[a-zA-Z ]+$/.test(v) && v.split(' ').length >= 2))) {
+          res.name = h;
+        }
+        if (!res.roll && (h.toLowerCase().includes('roll') || h.toLowerCase().includes('roll number') || h.toLowerCase().includes('id') || colValues.some(v => /\d{2,}/.test(v)))) {
+          res.roll = h;
+        }
+      }
+
+      // fallback: pick first columns
+      headers.forEach(h => {
+        if (!res.name && h.toLowerCase().includes('name')) res.name = h;
+        if (!res.roll && h.toLowerCase().includes('roll')) res.roll = h;
+        if (!res.total && h.toLowerCase().includes('total')) res.total = h;
+        if (!res.category && h.toLowerCase().includes('learner')) res.category = h;
+      });
+
+      // final fallback assignments
+      if (!res.name) res.name = headers[0];
+      if (!res.roll) res.roll = headers[1] || headers[0];
+      if (!res.total) res.total = headers.find(h => h.toLowerCase().includes('total')) || headers[headers.length - 1];
+      if (!res.category) res.category = headers.find(h => h.toLowerCase().includes('learner')) || headers[headers.length - 2];
+
+      // collect others to display if needed
+      headers.forEach(h => {
+        if (h !== res.name && h !== res.roll && h !== res.total && h !== res.category) res.other.push(h);
+      });
+
+      return res;
+    }
+
+    function displayData(data, statsContainer, tableContainer, key) {
+      // Calculate statistics (pass avg_marks from API response if available)
+      const stats = calculateStatistics(data.data, data.avg_marks);
       displayStatistics(stats, statsContainer);
 
-      // Create and display table
+      // Update button/card with student count if key provided
+      if (key) {
+        const count = data.data.length;
+        const btn = document.querySelector(`.excel-btn[onclick*="${key}"]`);
+        if (btn) {
+          // add small badge
+          let badge = btn.querySelector('.count-badge');
+          if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'count-badge';
+            badge.style.marginLeft = '8px';
+            badge.style.background = '#fff';
+            badge.style.color = '#4b86b4';
+            badge.style.padding = '2px 6px';
+            badge.style.borderRadius = '12px';
+            badge.style.fontSize = '0.8em';
+            btn.appendChild(badge);
+          }
+          badge.textContent = count;
+        }
+      }
+
+      // pick best columns to show
+      const cols = pickColumns(data.headers, data.data);
+
+      // Create and display table with selected columns
       const table = document.createElement('table');
       table.className = 'data-table';
 
-      // Table header
       const thead = document.createElement('thead');
       const headerRow = document.createElement('tr');
-      data.headers.forEach(header => {
+      const showHeaders = [cols.name, cols.roll, cols.total, cols.category];
+      showHeaders.forEach(header => {
         const th = document.createElement('th');
         th.textContent = header;
         headerRow.appendChild(th);
@@ -343,64 +438,76 @@
       thead.appendChild(headerRow);
       table.appendChild(thead);
 
-      // Table body
       const tbody = document.createElement('tbody');
       data.data.forEach(row => {
-        if (Object.values(row).some(v => v !== '')) { // Skip empty rows
+        if (Object.values(row).some(v => v !== '')) {
           const tr = document.createElement('tr');
-          data.headers.forEach(header => {
+          showHeaders.forEach(header => {
             const td = document.createElement('td');
-            const value = row[header];
-            
-            // Highlight learner categories
-            if (value.includes('Advance Learner')) {
+            const value = row[header] || '';
+            if (value.toString().includes('Advance Learner')) {
               td.innerHTML = `<span class="advance-learner">Advance Learner</span>`;
-            } else if (value.includes('Average Learner')) {
+            } else if (value.toString().includes('Average Learner')) {
               td.innerHTML = `<span class="average-learner">Average Learner</span>`;
-            } else if (value.includes('Slow Learner')) {
+            } else if (value.toString().includes('Slow Learner')) {
               td.innerHTML = `<span class="slow-learner">Slow Learner</span>`;
             } else {
               td.textContent = value;
             }
-            
             tr.appendChild(td);
           });
           tbody.appendChild(tr);
         }
       });
+
       table.appendChild(tbody);
       tableContainer.appendChild(table);
     }
 
-    function calculateStatistics(data) {
+    function calculateStatistics(data, avgMarks) {
       let advanceLearners = 0;
       let averageLearners = 0;
       let slowLearners = 0;
       let totalMarks = 0;
       let studentCount = 0;
+      let minMarks = Infinity;
+      let maxMarks = -Infinity;
 
       data.forEach(row => {
+        // Count learner categories
         Object.values(row).forEach(value => {
-          if (value.includes('Advance Learner')) advanceLearners++;
-          if (value.includes('Average Learner')) averageLearners++;
-          if (value.includes('Slow Learner')) slowLearners++;
+          if (value.includes('Advance Learner')) {
+            advanceLearners++;
+            return;
+          }
+          if (value.includes('Average Learner')) {
+            averageLearners++;
+            return;
+          }
+          if (value.includes('Slow Learner')) {
+            slowLearners++;
+            return;
+          }
         });
 
-        // Try to get total marks
-        const totalMarksValue = Object.values(row).find(v => {
-          return !isNaN(parseFloat(v)) && v !== '' && !v.includes('Learner');
-        });
+        // Get total marks and track min/max
+        const totalMarksValue = row.total;
         if (totalMarksValue && !isNaN(parseFloat(totalMarksValue))) {
-          totalMarks += parseFloat(totalMarksValue);
+          const marks = parseFloat(totalMarksValue);
+          totalMarks += marks;
           studentCount++;
+          minMarks = Math.min(minMarks, marks);
+          maxMarks = Math.max(maxMarks, marks);
         }
       });
 
       return {
-        advanceLearners: advanceLearners / 2 || 0, // Divide by 2 as it counts occurrences
-        averageLearners: averageLearners / 2 || 0,
-        slowLearners: slowLearners / 2 || 0,
-        averageMarks: studentCount > 0 ? (totalMarks / studentCount).toFixed(2) : 0
+        advanceLearners: advanceLearners,
+        averageLearners: averageLearners,
+        slowLearners: slowLearners,
+        averageMarks: avgMarks || (studentCount > 0 ? (totalMarks / studentCount).toFixed(2) : 0),
+        minMarks: minMarks === Infinity ? 0 : minMarks,
+        maxMarks: maxMarks === -Infinity ? 0 : maxMarks
       };
     }
 
@@ -422,6 +529,14 @@
           <h4>Average Marks</h4>
           <p>${stats.averageMarks}</p>
         </div>
+        <div class="stat-box">
+          <h4>Min Marks</h4>
+          <p>${stats.minMarks}</p>
+        </div>
+        <div class="stat-box">
+          <h4>Max Marks</h4>
+          <p>${stats.maxMarks}</p>
+        </div>
       `;
       container.innerHTML = statsHTML;
     }
@@ -437,6 +552,48 @@
         modal.style.display = 'none';
       }
     }
+
+    // Fetch counts for each subject on page load and show badge on buttons
+    function updateCountBadge(key, count, totalMarks) {
+      const btn = document.querySelector(`.excel-btn[onclick*="${key}"]`);
+      if (!btn) return;
+      let badge = btn.querySelector('.count-badge');
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'count-badge';
+        badge.style.marginLeft = '8px';
+        badge.style.background = '#fff';
+        badge.style.color = '#4b86b4';
+        badge.style.padding = '2px 6px';
+        badge.style.borderRadius = '12px';
+        badge.style.fontSize = '0.8em';
+        btn.appendChild(badge);
+      }
+      // Display total marks on badge
+      badge.textContent = totalMarks || count;
+    }
+
+    function loadCounts() {
+      fetch('/api/counts')
+        .then(res => {
+          if (!res.ok) throw new Error('Counts API not available');
+          return res.json();
+        })
+        .then(data => {
+          Object.keys(data).forEach(key => {
+            const info = data[key];
+            if (info && typeof info.total_marks !== 'undefined') {
+              updateCountBadge(key, info.total_students, info.total_marks);
+            }
+          });
+        })
+        .catch(err => {
+          // silently ignore; badges will appear when a subject is opened
+          console.warn('Could not load counts:', err);
+        });
+    }
+
+    document.addEventListener('DOMContentLoaded', loadCounts);
   </script>
 </body>
 </html>
